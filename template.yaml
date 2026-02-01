@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Auto-tag EC2 instances and EBS volumes based on IAM identity
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email for error alerts (optional)
+    Default: ''
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  AutoTaggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: resource-auto-tagger
+      Handler: resource-auto-tagger.lambda_handler
+      Runtime: python3.12
+      CodeUri: source/
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      Tracing: Active
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: EC2Describe
+              Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeVolumes
+              Resource: '*'
+            - Sid: EC2CreateTags
+              Effect: Allow
+              Action: ec2:CreateTags
+              Resource:
+                - !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
+                - !Sub arn:aws:ec2:*:${AWS::AccountId}:volume/*
+            - Sid: IAMReadTags
+              Effect: Allow
+              Action:
+                - iam:ListRoleTags
+                - iam:ListUserTags
+              Resource:
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/*
+                - !Sub arn:aws:iam::${AWS::AccountId}:user/*
+            - Sid: SSMRead
+              Effect: Allow
+              Action: ssm:GetParametersByPath
+              Resource: !Sub arn:aws:ssm:*:${AWS::AccountId}:parameter/auto-tag/*
+      Events:
+        EC2RunInstances:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.ec2
+              detail-type:
+                - AWS API Call via CloudTrail
+              detail:
+                eventSource:
+                  - ec2.amazonaws.com
+                eventName:
+                  - RunInstances
+
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: resource-auto-tagger-dlq
+      MessageRetentionPeriod: 1209600
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/resource-auto-tagger
+      RetentionInDays: 30
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: resource-auto-tagger-errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AutoTaggerFunction
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], []]
+      TreatMissingData: notBreaching
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      TopicName: resource-auto-tagger-alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+Outputs:
+  FunctionArn:
+    Value: !GetAtt AutoTaggerFunction.Arn
+  DLQUrl:
+    Value: !Ref DLQ
