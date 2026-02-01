@@ -2,14 +2,35 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Auto-tag EC2 instances and EBS volumes based on IAM identity
 
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: resource-auto-tagger
+    Description: Automatically tag EC2 instances based on IAM identity
+    Author: AWS
+    SpdxLicenseId: MIT-0
+    Labels: ['ec2', 'tagging', 'automation', 'governance']
+
 Parameters:
   AlertEmail:
     Type: String
     Description: Email for error alerts (optional)
     Default: ''
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 128
+    Tracing: Active
+    Architectures:
+      - arm64
 
 Resources:
   AutoTaggerFunction:
@@ -17,15 +38,16 @@ Resources:
     Properties:
       FunctionName: resource-auto-tagger
       Handler: resource-auto-tagger.lambda_handler
-      Runtime: python3.12
       CodeUri: source/
-      Timeout: 60
-      MemorySize: 128
+      Description: Auto-tags EC2 instances and EBS volumes based on IAM identity
       ReservedConcurrentExecutions: 10
-      Tracing: Active
       DeadLetterQueue:
         Type: SQS
         TargetArn: !GetAtt DLQ.Arn
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          POWERTOOLS_SERVICE_NAME: resource-auto-tagger
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -73,17 +95,21 @@ Resources:
     Properties:
       QueueName: resource-auto-tagger-dlq
       MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
 
   LogGroup:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Properties:
-      LogGroupName: /aws/lambda/resource-auto-tagger
+      LogGroupName: !Sub /aws/lambda/${AutoTaggerFunction}
       RetentionInDays: 30
 
   ErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: resource-auto-tagger-errors
+      AlarmDescription: Triggers when Lambda function has errors
       MetricName: Errors
       Namespace: AWS/Lambda
       Statistic: Sum
@@ -102,12 +128,21 @@ Resources:
     Condition: HasAlertEmail
     Properties:
       TopicName: resource-auto-tagger-alerts
+      KmsMasterKeyId: alias/aws/sns
       Subscription:
         - Protocol: email
           Endpoint: !Ref AlertEmail
 
 Outputs:
   FunctionArn:
+    Description: Lambda function ARN
     Value: !GetAtt AutoTaggerFunction.Arn
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref AutoTaggerFunction
   DLQUrl:
+    Description: Dead letter queue URL
     Value: !Ref DLQ
+  DLQArn:
+    Description: Dead letter queue ARN
+    Value: !GetAtt DLQ.Arn
